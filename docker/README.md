@@ -1,6 +1,6 @@
 # AI research Docker environments
 
-This host has Docker Engine, Docker Compose, and NVIDIA Container Toolkit. Each experiment gets its own directory, Docker image, Python dependency list, code mount, data mount, and output mount.
+Each experiment gets its own directory, Docker image, Python dependency list, code mount, data mount, and output mount. This needs Docker Engine, Docker Compose, and the NVIDIA Container Toolkit; on Ubuntu, `setup-host.sh` installs them.
 
 ## Create an experiment
 
