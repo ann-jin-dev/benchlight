@@ -1,0 +1,24 @@
+# Installed by install.sh as a systemd user service (needs `loginctl enable-linger`).
+# Keeps one Claude Code Remote Control session open for @WORKDIR@, so the
+# workstation can be driven from claude.ai/code or the Claude app on a phone.
+[Unit]
+Description=Claude Code Remote Control for @WORKDIR@
+Documentation=https://code.claude.com/docs/en/remote-control
+# Never stop retrying: network outages and logouts must not need a human.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKDIR@
+ExecStart="@HOME@/.local/bin/claude" remote-control --name "@NAME@" --spawn same-dir
+Environment="PATH=@HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Restart=always
+RestartSec=10s
+TimeoutStopSec=45s
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=1min
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=default.target

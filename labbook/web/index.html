@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>labbook · Benchlight</title>
+  <link rel="icon" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#/live"><img src="/static/favicon.svg" alt="" width="20" height="20"> labbook</a>
+    <nav class="tabs" aria-label="Views">
+      <a href="#/live" data-tab="live">Live</a>
+      <a href="#/receipts" data-tab="receipts">Receipts</a>
+      <a href="#/runs" data-tab="runs">Agent runs</a>
+      <a href="#/public" data-tab="public">Public window</a>
+    </nav>
+    <span class="spacer"></span>
+    <span id="freshness" class="status">connecting</span>
+  </header>
+  <main id="view" aria-live="polite"></main>
+  <script src="/static/chart.js"></script>
+  <script src="/static/public.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

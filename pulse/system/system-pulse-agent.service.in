@@ -1,0 +1,17 @@
+# Installed by install.sh as a systemd user service (needs `loginctl enable-linger`).
+[Unit]
+Description=System Pulse host telemetry agent
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@PULSE_DIR@
+ExecStart=/usr/bin/python3 "@PULSE_DIR@/agent.py"
+Environment=PYTHONUNBUFFERED=1
+Environment="PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Restart=always
+RestartSec=5
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

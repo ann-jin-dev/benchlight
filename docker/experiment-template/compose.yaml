@@ -1,0 +1,54 @@
+x-experiment: &experiment
+  image: "${RESEARCH_IMAGE:?Set RESEARCH_IMAGE in .env}"
+  build:
+    context: .
+  init: true
+  tty: true
+  stdin_open: true
+  shm_size: 8gb
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  working_dir: /workspace/code
+  environment:
+    HOME: /workspace/cache
+    PIP_CACHE_DIR: /workspace/cache/pip
+    PYTHONUNBUFFERED: "1"
+  volumes:
+    - "${CODE_DIR:-./code}:/workspace/code"
+    - "${DATA_DIR:-./data}:/workspace/data:ro"
+    - "${OUTPUT_DIR:-./outputs}:/workspace/outputs"
+    - "${CACHE_DIR:-./cache}:/workspace/cache"
+  command: ["sleep", "infinity"]
+
+services:
+  gpu0:
+    <<: *experiment
+    profiles: [gpu0]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  gpu1:
+    <<: *experiment
+    profiles: [gpu1]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+
+  both:
+    <<: *experiment
+    profiles: [both]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1"]
+              capabilities: [gpu]

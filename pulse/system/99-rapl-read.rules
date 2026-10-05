@@ -1,0 +1,8 @@
+# Let members of the "power" group read the CPU package energy counter, so
+# System Pulse can measure CPU watts without sudo. Install as root:
+#   groupadd -f power && usermod -aG power "$USER"
+#   cp 99-rapl-read.rules /etc/udev/rules.d/ && udevadm control --reload
+#   udevadm trigger --subsystem-match=powercap
+# Linux made energy_uj root-only after the PLATYPUS power side channel
+# (CVE-2020-8694). Grant it only on a machine whose local users you trust.
+ACTION=="add|change", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:0", RUN+="/bin/chgrp power /sys%p/energy_uj", RUN+="/bin/chmod g+r /sys%p/energy_uj"

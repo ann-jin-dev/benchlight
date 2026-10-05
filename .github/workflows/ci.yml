@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: gpuq
+        working-directory: gpuq
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: System Pulse
+        working-directory: pulse
+        run: python -m unittest test_meter test_monitoring -v
+      - name: labbook
+        run: python -m unittest discover -s labbook/tests -p 'test_*.py' -v
+      - name: installer (stubbed host)
+        run: bash tests/install_test.sh
+      - name: codex-task parses
+        run: python -m py_compile codex-bridge/bin/codex-task
+
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --severity=warning install.sh docker/*.sh remote-control/headless-display/virtual-display.sh tests/*.sh

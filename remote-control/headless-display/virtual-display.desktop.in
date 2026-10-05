@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Virtual Display
+Comment=Keep a GNOME monitor active for Desktop Sharing
+Exec=@SCRIPT@
+Terminal=false
+X-GNOME-Autostart-enabled=true

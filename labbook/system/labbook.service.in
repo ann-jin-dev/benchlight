@@ -1,0 +1,15 @@
+# Installed by install.sh as a systemd user service (needs `loginctl enable-linger`).
+[Unit]
+Description=labbook: receipts, run replay and live dashboard on 127.0.0.1:@PORT@
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 "@LABBOOK_DIR@/labbook" serve --port @PORT@
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

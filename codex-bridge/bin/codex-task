@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""Drive local Codex research runs from Claude.
+
+Claude writes a brief; Codex executes it through `codex app-server` (the same
+protocol the Codex desktop app uses), so every run is an ordinary interactive
+thread named "[Claude] <name>" that shows up in the Codex app.
+
+Each turn runs in a detached runner process and is recorded under
+~/codex-runs/<id>/turns/<n>/. A turn's end is signalled by the runner seeing
+`turn/completed`, by Codex's notify hook (`_hook`), or by the runner exiting.
+
+Wake-up for Claude: run `codex-task wait <id> --timeout <s>` as a background
+command. It returns when the turn ends (full report) or when the check-in
+timer expires (compact progress snapshot). While a turn runs, `steer` adds
+guidance to it and `stop` interrupts it.
+
+Unattended fallback: if no waiter is alive AND the owning Claude process is
+gone when a turn ends, the hook resumes the Claude session headlessly with a
+narrow tool allowlist, bounded by --max-wakes per run. `codex-task halt`
+disables all unattended wakes; `codex-task unhalt` re-enables them.
+
+Provenance: each turn's Codex process gets CODEX_TASK_RUN/CODEX_TASK_TURN, so
+`gpuq submit` records which run and turn asked for a job. `note` appends
+verification verdicts and human decisions to the run's notes.jsonl. The lab
+notebook (labbook/) replays all of it as one timeline.
+
+Don't type into a "[Claude]" thread in the Codex app while its turn is
+running; between turns it is safe to read or continue it there.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+RUNS = Path(os.environ.get("CODEX_RUNS_DIR", Path.home() / "codex-runs"))
+HALT = RUNS / "HALT"
+SELF = str(Path(__file__).resolve())
+CODEX = shutil.which("codex") or str(Path.home() / ".local/bin/codex")
+CLAUDE = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+# Unset means Codex's own configured defaults (~/.codex/config.toml).
+DEFAULT_MODEL = os.environ.get("CODEX_TASK_MODEL") or None
+DEFAULT_EFFORT = os.environ.get("CODEX_TASK_EFFORT") or None
+CLIENT = {"name": "codex_task", "title": "Claude supervisor", "version": "0.2"}
+
+PROTOCOL = """
+
+---
+## Operating protocol (from the supervising agent)
+
+You are executing this brief for a supervising agent (Claude) that reads only
+your final message of each turn. Work autonomously; decide anything you
+reasonably can yourself and record the decision. Follow AGENTS.md: GPU work goes
+through `gpuq` (use `gpuq wait <job>` to block on jobs you submitted).
+
+End your turn only when (a) the brief or current phase is done, (b) you need a
+decision you should not make yourself, or (c) you are blocked. Your FINAL
+message must use this structure and stay under ~60 lines:
+
+## Summary
+2-5 lines: what you did and the headline result.
+## Results
+Key numbers with the comparison baseline, seeds/CI, and file paths to the source.
+## Decisions made
+Choices you made that the supervisor might want to revisit.
+## Artifacts
+Paths to reports, scripts, and outputs.
+## Next
+What you would do next, or your question(s), each with your recommended default.
+STATUS: DONE | QUESTION | BLOCKED
+"""
+
+
+def now():
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def rdir(rid):
+    d = RUNS / rid
+    if not d.is_dir():
+        sys.exit(f"no such run: {rid}")
+    return d
+
+
+def load(rid):
+    return json.loads((rdir(rid) / "meta.json").read_text())
+
+
+def save(meta):
+    p = RUNS / meta["id"] / "meta.json"
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(meta, indent=2))
+    tmp.replace(p)
+
+
+def tdir(rid, n):
+    return RUNS / rid / "turns" / str(n)
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+    try:  # zombies count as dead
+        return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+    except OSError:
+        return False
+
+
+def read(p, default=""):
+    try:
+        return Path(p).read_text()
+    except OSError:
+        return default
+
+
+def turn_state(rid, n):
+    t = tdir(rid, n)
+    if (t / "ended").exists():
+        return "ended"
+    return "running" if alive(read(t / "runner.pid").strip()) else "starting"
+
+
+def claude_session_cwd(sid):
+    for f in (Path.home() / ".claude/projects").glob(f"*/{sid}.jsonl"):
+        with open(f) as fh:
+            for line in fh:
+                m = re.search(r'"cwd":"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    return None
+
+
+def thread_title(meta):
+    return f"[Claude] {meta['name']}"
+
+
+# --------------------------------------------------------------------------
+# app-server client
+
+class AppServer:
+    """Minimal JSON-RPC client for `codex app-server` over stdio."""
+
+    def __init__(self, config_args, stderr_path, on_message, env=None):
+        self.p = subprocess.Popen([CODEX, "app-server", *config_args],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=open(stderr_path, "w"), text=True, bufsize=1, env=env)
+        self.q = queue.Queue()
+        self.next_id = 0
+        self.on_message = on_message
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        for line in self.p.stdout:
+            try:
+                self.q.put(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        self.q.put(None)
+
+    def _write(self, msg):
+        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.flush()
+
+    def notify(self, method, params=None):
+        self._write({"method": method, "params": params or {}})
+
+    def respond(self, rid, result):
+        self._write({"id": rid, "result": result})
+
+    def call(self, method, params, timeout=300):
+        self.next_id += 1
+        rid = self.next_id
+        self._write({"id": rid, "method": method, "params": params})
+        deadline = time.time() + timeout
+        while True:
+            m = self.pump(max(0.1, deadline - time.time()))
+            if m is not None and m.get("id") == rid and "method" not in m:
+                if "error" in m:
+                    raise RuntimeError(f"{method}: {m['error']}")
+                return m.get("result")
+            if time.time() > deadline:
+                raise TimeoutError(method)
+
+    def pump(self, timeout):
+        """Handle one incoming message; returns it (None on timeout)."""
+        try:
+            m = self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if m is None:
+            raise EOFError("app-server exited")
+        if "method" in m:
+            self.on_message(m)
+        return m
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=10)
+        except Exception:
+            self.p.kill()
+
+
+# --------------------------------------------------------------------------
+# launching turns
+
+def launch(meta, n, prompt):
+    t = tdir(meta["id"], n)
+    t.mkdir(parents=True, exist_ok=True)
+    (t / "prompt.md").write_text(prompt)
+    (t / "started").write_text(now())
+    meta["turns"] = n
+    save(meta)
+    subprocess.Popen(
+        [sys.executable, SELF, "_run", meta["id"], str(n)],
+        stdin=subprocess.DEVNULL,
+        stdout=open(t / "runner.log", "a"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        cwd=meta["cwd"],
+    )
+
+
+def cmd_start(a):
+    prompt = Path(a.brief).read_text() if a.brief else (a.prompt or sys.stdin.read())
+    if not prompt.strip():
+        sys.exit("empty brief")
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    rid = f"{stamp}-{re.sub(r'[^A-Za-z0-9_-]+', '-', a.name)}"
+    (RUNS / rid).mkdir(parents=True)
+    sid = None if a.no_wake else (a.claude_session or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    meta = {
+        "id": rid,
+        "name": a.name,
+        "cwd": str(Path(a.cd).resolve()),
+        "created": now(),
+        "model": a.model,
+        "effort": a.effort,
+        "sandbox": a.sandbox,
+        "codex_config": a.codex_config or [],
+        "thread_id": None,
+        "fork_from": None,
+        "turns": 0,
+        "claude_session": sid,
+        "claude_cwd": claude_session_cwd(sid) if sid else None,
+        "claude_pid": os.environ.get("CLAUDE_PID") if sid else None,
+        "wakes": 0,
+        "max_wakes": a.max_wakes,
+    }
+    save(meta)
+    launch(meta, 1, prompt + PROTOCOL)
+    print(f"run {rid} turn 1 started (Codex app thread: {thread_title(meta)})")
+    print(f"dir {RUNS / rid}")
+
+
+def wait_runner(rid, n, secs):
+    pid = read(tdir(rid, n) / "runner.pid").strip()
+    for _ in range(secs):
+        if not alive(pid):
+            return True
+        time.sleep(1)
+    return not alive(pid)
+
+
+def cmd_resume(a):
+    meta = load(a.id)
+    n = meta["turns"]
+    if n and turn_state(a.id, n) != "ended":
+        sys.exit(f"turn {n} is still running; use `steer` or `stop` first")
+    if not meta.get("thread_id"):
+        sys.exit("no codex thread recorded; cannot resume")
+    wait_runner(a.id, n, 60)
+    msg = a.message or sys.stdin.read()
+    launch(meta, n + 1, msg)
+    print(f"run {a.id} turn {n + 1} started")
+
+
+def cmd_adopt(a):
+    """Move a run started with `codex exec` onto a visible app-server thread (fork)."""
+    meta = load(a.id)
+    n = meta["turns"]
+    if not meta.get("thread_id"):
+        sys.exit("run has no thread to adopt")
+    if n and turn_state(a.id, n) != "ended":
+        sys.exit(f"turn {n} is still running")
+    srv = AppServer([], RUNS / a.id / "adopt.stderr.log", lambda m: None)
+    try:
+        srv.call("initialize", {"clientInfo": CLIENT})
+        srv.notify("initialized")
+        r = srv.call("thread/fork", {"threadId": meta["thread_id"], "excludeTurns": True,
+                                     **thread_params(meta)})
+        tid = r["thread"]["id"]
+        srv.call("thread/name/set", {"threadId": tid, "name": thread_title(meta)})
+    finally:
+        srv.close()
+    meta["fork_from"], meta["thread_id"] = meta["thread_id"], tid
+    save(meta)
+    # A fork has no messages of its own, so the app lists it only after the next turn.
+    print(f"forked {meta['fork_from']} -> {tid} as '{thread_title(meta)}'; "
+          f"it appears in the Codex app after the next `resume`")
+
+
+def thread_params(meta):
+    p = {"cwd": meta["cwd"]}
+    if meta.get("model"):
+        p["model"] = meta["model"]
+    if meta.get("sandbox"):
+        p.update(sandbox=meta["sandbox"], approvalPolicy="never")
+    else:  # equivalent of `--approve-for-me`
+        p.update(sandbox="workspace-write", approvalPolicy="on-request",
+                 approvalsReviewer="auto_review")
+    return p
+
+
+def cmd_run(a):
+    """Internal: execute one turn through the app-server, then record its end."""
+    meta = load(a.id)
+    n = int(a.turn)
+    t = tdir(a.id, n)
+    (t / "runner.pid").write_text(str(os.getpid()))
+    (t / "steer").mkdir(exist_ok=True)
+    ev = open(t / "events.jsonl", "a")
+    st = {"turn_id": None, "done": False, "last_msg": "", "status": None, "error": None}
+
+    def log(obj):
+        ev.write(json.dumps(obj) + "\n")
+        ev.flush()
+
+    def on_message(m):
+        method, params = m["method"], m.get("params", {})
+        if "id" in m:  # server -> client request; nothing should reach us under auto review
+            log({"type": "server_request", "method": method, "params": params})
+            if "requestApproval" in method or method in ("execCommandApproval", "applyPatchApproval"):
+                srv.respond(m["id"], {"decision": "decline"})
+            else:
+                srv._write({"id": m["id"], "error": {"code": -32601, "message": "unsupported by codex-task"}})
+            return
+        if method == "item/completed":
+            it = params.get("item", {})
+            log({"type": "item", "turn": params.get("turnId"), "item": it})
+            if it.get("type") == "agentMessage":
+                st["last_msg"] = it.get("text", "")
+        elif method in ("turn/started", "thread/started", "thread/status/changed", "error") \
+                or "tokenUsage" in method:
+            log({"type": method, "params": params})
+        elif method == "turn/completed":
+            turn = params.get("turn", {})
+            log({"type": method, "turn": {k: v for k, v in turn.items() if k != "items"}})
+            if st["turn_id"] in (None, turn.get("id")):
+                st["done"], st["status"], st["error"] = True, turn.get("status"), turn.get("error")
+
+    cfg = ["-c", "notify=" + json.dumps([SELF, "_hook", a.id, str(n)])]
+    for kv in meta.get("codex_config", []):
+        cfg += ["-c", kv]
+    # Commands Codex runs inherit these, so gpuq can record the job's origin.
+    env = dict(os.environ, CODEX_TASK_RUN=a.id, CODEX_TASK_TURN=str(n))
+    srv = AppServer(cfg, t / "stderr.log", on_message, env=env)
+    (t / "server.pid").write_text(str(srv.p.pid))
+    rc = 0
+    try:
+        srv.call("initialize", {"clientInfo": CLIENT})
+        srv.notify("initialized")
+        params = thread_params(meta)
+        if meta.get("thread_id"):
+            tid = meta["thread_id"]
+            srv.call("thread/resume", {"threadId": tid, "excludeTurns": True, **params})
+        else:
+            tid = srv.call("thread/start", params)["thread"]["id"]
+            meta = load(a.id)
+            meta["thread_id"] = tid
+            save(meta)
+            srv.call("thread/name/set", {"threadId": tid, "name": thread_title(meta)})
+        turn = {"threadId": tid, "input": [{"type": "text", "text": (t / "prompt.md").read_text()}]}
+        turn.update({key: meta[key] for key in ("effort", "model") if meta.get(key)})
+        r = srv.call("turn/start", turn)
+        st["turn_id"] = r["turn"]["id"]
+        (t / "turn_id").write_text(st["turn_id"])
+        while not st["done"]:
+            srv.pump(2)
+            for f in sorted((t / "steer").glob("*.txt")):
+                try:
+                    srv.call("turn/steer", {"threadId": tid, "expectedTurnId": st["turn_id"],
+                                            "input": [{"type": "text", "text": f.read_text()}]})
+                    f.rename(f.with_suffix(".sent"))
+                except Exception as e:
+                    f.with_suffix(".err").write_text(str(e))
+                    f.unlink()
+            if (t / "interrupt").exists() and not (t / "interrupt.sent").exists():
+                srv.call("turn/interrupt", {"threadId": tid, "turnId": st["turn_id"]})
+                (t / "interrupt.sent").write_text(now())
+    except Exception as e:
+        rc = 1
+        st["error"] = f"{type(e).__name__}: {e}"
+        log({"type": "runner_error", "error": st["error"]})
+    finally:
+        srv.close()
+    final = st["last_msg"].strip()
+    if st["status"] not in (None, "completed") or st["error"]:
+        final += f"\n\n(turn status: {st['status']}; error: {st['error']})"
+        rc = rc or 2
+    (t / "final.md").write_text(final)
+    (t / "exit_code").write_text(str(rc))
+    signal_end(a.id, n, "runner", rc)
+
+
+def cmd_hook(a):
+    """Internal: codex notify entry point."""
+    t = tdir(a.id, int(a.turn))
+    try:
+        payload = json.loads(a.payload)
+    except json.JSONDecodeError:
+        payload = {"raw": a.payload}
+    if payload.get("type") != "agent-turn-complete":
+        return
+    (t / "notify.json").write_text(json.dumps(payload, indent=2))
+    signal_end(a.id, int(a.turn), "notify")
+
+
+def signal_end(rid, n, source, rc=None):
+    t = tdir(rid, n)
+    try:
+        fd = os.open(t / "ended", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return  # already signalled by the other path
+    os.write(fd, json.dumps({"source": source, "rc": rc, "at": now()}).encode())
+    os.close(fd)
+    maybe_wake_claude(rid, n)
+
+
+def wlog(rid, text):
+    with open(RUNS / rid / "wake.log", "a") as f:
+        f.write(f"{now()} {text}\n")
+
+
+def maybe_wake_claude(rid, n):
+    meta = load(rid)
+    if alive(read(RUNS / rid / "waiter.pid").strip()):
+        return  # a live `wait` returns and wakes Claude in-session
+    if not meta.get("claude_session"):
+        return
+    if HALT.exists():
+        return wlog(rid, f"turn {n}: HALT present; not waking")
+    if alive(meta.get("claude_pid")):
+        return wlog(rid, f"turn {n}: Claude process alive but no waiter; not waking")
+    if meta["wakes"] >= meta["max_wakes"]:
+        return wlog(rid, f"turn {n}: wake budget exhausted")
+    # Give the runner time to write final.md before Claude reads it.
+    wait_runner(rid, n, 30)
+    meta["wakes"] += 1
+    save(meta)
+    msg = (f"[codex-task] Codex run {rid} turn {n} ended (unattended wake "
+           f"{meta['wakes']}/{meta['max_wakes']}). Run `codex-task show {rid}` to read the "
+           f"result, then continue the research loop: `codex-task resume {rid} \"...\"` "
+           f"followed by `codex-task wait {rid} --timeout S`. Stop and summarize instead if "
+           f"the run needs a user decision.")
+    cmd = [CLAUDE, "-p", "--resume", meta["claude_session"],
+           "--permission-mode", "dontAsk",
+           "--allowedTools", "Bash(codex-task *)", "Bash(gpuq status*)", "Read", "Grep", "Glob",
+           "--", msg]
+    wlog(rid, f"turn {n}: waking Claude headless ({meta['wakes']}/{meta['max_wakes']})")
+    # The hook runs inside Codex's environment; Claude's own jobs must not be
+    # recorded as this Codex turn's.
+    env = {k: v for k, v in os.environ.items() if k not in ("CODEX_TASK_RUN", "CODEX_TASK_TURN")}
+    subprocess.Popen(cmd, cwd=meta.get("claude_cwd") or meta["cwd"], env=env,
+                     stdin=subprocess.DEVNULL,
+                     stdout=open(RUNS / rid / f"wake-{n}.log", "a"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+
+
+# --------------------------------------------------------------------------
+# observing
+
+def final_text(rid, n):
+    t = tdir(rid, n)
+    txt = read(t / "final.md").strip()
+    if not txt:
+        try:
+            txt = json.loads(read(t / "notify.json", "{}")).get("last-assistant-message", "")
+        except json.JSONDecodeError:
+            txt = ""
+    if not txt:
+        errs = [l[:400] for l in read(t / "events.jsonl").splitlines()
+                if '"runner_error"' in l or '"type": "error"' in l or '"turn.failed"' in l]
+        txt = "(no final message)\n" + "\n".join(errs[-3:])
+        txt += "\n" + read(t / "stderr.log")[-1500:]
+    return txt
+
+
+def status_line(txt):
+    m = re.findall(r"STATUS:\s*([A-Z]+)", txt)
+    return m[-1] if m else "UNKNOWN"
+
+
+def describe(it):
+    k = it.get("type")
+    if k in ("commandExecution", "command_execution"):
+        code = it.get("exitCode", it.get("exit_code"))
+        return f"$ {str(it.get('command', ''))[:160]}  -> exit {code}"
+    if k in ("agentMessage", "agent_message"):
+        return "msg: " + it.get("text", "").replace("\n", " ")[:300]
+    if k in ("fileChange", "file_change"):
+        paths = [c.get("path", "?") for c in it.get("changes", [])]
+        return f"edit: {', '.join(paths)[:160]}"
+    return None
+
+
+def snapshot(rid, n, lines=12):
+    """Compact progress view of a running turn."""
+    t = tdir(rid, n)
+    items = []
+    for l in read(t / "events.jsonl").splitlines():
+        try:
+            e = json.loads(l)
+        except json.JSONDecodeError:
+            continue
+        it = e.get("item") if e.get("type") in ("item", "item.completed") else None
+        d = describe(it) if it else None
+        if d:
+            items.append(d)
+    ncmd = sum(1 for i in items if i.startswith("$"))
+    out = [f"turn {n} running since {read(t / 'started').strip()}; "
+           f"{len(items)} items ({ncmd} commands)"]
+    out += items[-lines:]
+    try:
+        q = subprocess.run(["gpuq", "status"], capture_output=True, text=True, timeout=20).stdout
+        jobs = [l for l in q.splitlines()
+                if re.search(r"running|queued|pending", l, re.I)
+                and not l.startswith(("No pending", "Worker:"))]
+        if jobs:
+            out.append("gpuq: " + " | ".join(jobs[:6]))
+    except Exception:
+        pass
+    return "\n".join(out)
+
+
+def cmd_wait(a):
+    meta = load(a.id)
+    n = meta["turns"]
+    pidf = RUNS / a.id / "waiter.pid"
+    pidf.write_text(str(os.getpid()))
+    deadline = time.time() + a.timeout if a.timeout else None
+    try:
+        while turn_state(a.id, n) != "ended":
+            if deadline and time.time() >= deadline:
+                print(f"CHECK-IN (timer {a.timeout}s) run {a.id}")
+                print(snapshot(a.id, n))
+                return 3
+            time.sleep(5)
+        wait_runner(a.id, n, 30)  # let the runner write final.md
+    finally:
+        if read(pidf).strip() == str(os.getpid()):
+            pidf.unlink(missing_ok=True)
+    txt = final_text(a.id, n)
+    print(f"TURN ENDED run {a.id} turn {n} STATUS: {status_line(txt)} "
+          f"exit={read(tdir(a.id, n) / 'exit_code').strip() or '?'}")
+    print(txt)
+    return 0
+
+
+def cmd_show(a):
+    meta = load(a.id)
+    n = a.turn or meta["turns"]
+    state = turn_state(a.id, n)
+    if state != "ended" and not a.turn:
+        print(snapshot(a.id, n))
+        return
+    txt = final_text(a.id, n)
+    print(f"run {a.id} turn {n} [{state}] STATUS: {status_line(txt)}")
+    print(txt)
+
+
+def cmd_status(a):
+    runs = [a.id] if a.id else sorted(p.parent.name for p in RUNS.glob("*/meta.json"))
+    if HALT.exists():
+        print("HALT: unattended wakes disabled")
+    for rid in runs[-a.limit:]:
+        m = load(rid)
+        n = m["turns"]
+        st = turn_state(rid, n) if n else "-"
+        tag = status_line(final_text(rid, n)) if st == "ended" else ""
+        print(f"{rid:45} turn {n:<3} {st:8} {tag:9} wakes {m['wakes']}/{m['max_wakes']}  {m['cwd']}")
+
+
+def cmd_steer(a):
+    meta = load(a.id)
+    n = meta["turns"]
+    if turn_state(a.id, n) != "running":
+        sys.exit(f"turn {n} is not running; use `resume`")
+    f = tdir(a.id, n) / "steer" / f"{time.time_ns()}.txt"
+    f.write_text(a.message or sys.stdin.read())
+    for _ in range(60):
+        if f.with_suffix(".sent").exists():
+            return print(f"steered turn {n}")
+        if f.with_suffix(".err").exists():
+            sys.exit("steer failed: " + read(f.with_suffix(".err")))
+        time.sleep(1)
+    sys.exit("steer not delivered within 60s (still queued)")
+
+
+def cmd_stop(a):
+    meta = load(a.id)
+    n = meta["turns"]
+    t = tdir(a.id, n)
+    if turn_state(a.id, n) != "running":
+        sys.exit("no running turn")
+    (t / "interrupt").write_text(now())
+    if not wait_runner(a.id, n, 60):
+        for pf in ("server.pid", "runner.pid"):
+            pid = read(t / pf).strip()
+            if alive(pid):
+                os.kill(int(pid), signal.SIGTERM)
+    print(f"stopped turn {n}; resume with new instructions via `codex-task resume {a.id}`")
+
+
+def cmd_note(a):
+    """Record a verification verdict or a human decision on a run's timeline."""
+    meta = load(a.id)
+    text = a.message or sys.stdin.read()
+    if not text.strip():
+        sys.exit("empty note")
+    entry = {"at": now(), "by": a.by, "kind": a.kind, "turn": a.turn or meta["turns"],
+             "text": text.strip()}
+    with open(RUNS / a.id / "notes.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    print(f"noted ({a.by}, {a.kind}) on run {a.id} turn {entry['turn']}")
+
+
+def cmd_halt(a):
+    RUNS.mkdir(parents=True, exist_ok=True)
+    HALT.write_text(now())
+    print("unattended wakes disabled (running Codex turns are unaffected; use `stop`)")
+
+
+def cmd_unhalt(a):
+    HALT.unlink(missing_ok=True)
+    print("unattended wakes enabled")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="codex-task", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sp.add_parser("start", help="start a run from a brief")
+    s.add_argument("--name", required=True)
+    s.add_argument("--cd", default=".", help="working directory for codex")
+    s.add_argument("--brief", help="brief file (else PROMPT arg or stdin)")
+    s.add_argument("--model", default=DEFAULT_MODEL)
+    s.add_argument("--effort", default=DEFAULT_EFFORT)
+    s.add_argument("--sandbox", help="explicit sandbox with no approvals; replaces auto review")
+    s.add_argument("--codex-config", action="append", help="extra `-c key=value` for app-server")
+    s.add_argument("--claude-session", help="default: $CLAUDE_CODE_SESSION_ID")
+    s.add_argument("--no-wake", action="store_true", help="never wake Claude headlessly")
+    s.add_argument("--max-wakes", type=int, default=20)
+    s.add_argument("prompt", nargs="?")
+    s.set_defaults(fn=cmd_start)
+
+    s = sp.add_parser("resume", help="send the next instruction to a run")
+    s.add_argument("id")
+    s.add_argument("message", nargs="?")
+    s.set_defaults(fn=cmd_resume)
+
+    s = sp.add_parser("steer", help="add guidance to the running turn")
+    s.add_argument("id")
+    s.add_argument("message", nargs="?")
+    s.set_defaults(fn=cmd_steer)
+
+    s = sp.add_parser("adopt", help="fork an old exec-based run into a visible thread")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_adopt)
+
+    s = sp.add_parser("wait", help="block until the turn ends or the check-in timer fires")
+    s.add_argument("id")
+    s.add_argument("--timeout", type=int, default=0, help="seconds; 0 = no timer")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sp.add_parser("show", help="final message (or progress snapshot if running)")
+    s.add_argument("id")
+    s.add_argument("--turn", type=int)
+    s.set_defaults(fn=cmd_show)
+
+    s = sp.add_parser("status", help="list runs")
+    s.add_argument("id", nargs="?")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(fn=cmd_status)
+
+    s = sp.add_parser("stop", help="interrupt the running turn")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_stop)
+
+    s = sp.add_parser("note", help="record a verdict or decision on the run's timeline")
+    s.add_argument("id")
+    s.add_argument("--by", choices=("claude", "human", "codex"), default="claude")
+    s.add_argument("--kind", choices=("verdict", "decision", "note"), default="note")
+    s.add_argument("--turn", type=int, help="default: the latest turn")
+    s.add_argument("message", nargs="?")
+    s.set_defaults(fn=cmd_note)
+
+    sp.add_parser("halt", help="disable unattended Claude wakes").set_defaults(fn=cmd_halt)
+    sp.add_parser("unhalt", help="re-enable unattended wakes").set_defaults(fn=cmd_unhalt)
+
+    for name, fn, args in (("_run", cmd_run, ["id", "turn"]),
+                           ("_hook", cmd_hook, ["id", "turn", "payload"])):
+        s = sp.add_parser(name)
+        for x in args:
+            s.add_argument(x)
+        s.set_defaults(fn=fn)
+
+    a = ap.parse_args()
+    sys.exit(a.fn(a) or 0)
+
+
+if __name__ == "__main__":
+    main()
